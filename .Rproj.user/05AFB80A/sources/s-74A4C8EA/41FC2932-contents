@@ -1,0 +1,120 @@
+library(readxl)
+library(osmdata) #https://rforjournalists.com/2020/12/15/how-to-access-open-street-map-in-r/
+library(tmaptools) #https://rdrr.io/cran/tmaptools/man/geocode_OSM.html
+library(stringr)
+library(data.table)
+library(ggplot2)
+library(osmar) #https://gis.stackexchange.com/questions/218072/how-can-i-use-roads-from-osm-data-in-r/218306
+library(geosphere)
+library(pracma) #necessary for haversine funciton
+library(sf)
+
+#List of vehicle names and map ids
+#Also contains type of vehicle
+conversion_table <- read_excel("./data/Chip_MAP.xlsx")
+address_df <- read.csv("./data/DRIVES_staticHearing.csv")
+
+address_df <- address_df[, c("map_id", "Street", "City", "County", "State", "zip")]
+
+ids_in_plasma_drive <- read.csv( "./data/plasma_driving_overlap.csv")
+ids_in_csf_drive <- read.csv("./data/csf_driving_overlap.csv")
+
+ids_to_keep <- unique(rbind(ids_in_plasma_drive, ids_in_csf_drive))
+
+address_df <- address_df[address_df$map_id %in% ids_to_keep$x,]
+rm(ids_in_csf_drive, ids_in_plasma_drive)
+
+address_df <- unique(address_df)
+address_df$fullSearch <- paste0(address_df$Street, ", ", address_df$City, ", ", address_df$State)
+#geocoding. 
+#when address doesn't work for lat long, 
+#using street name without number (apparently a common bug relating to street length in osm)
+#when neither of the above options work, using 9 digit zip
+latLongs_address <- geocode_OSM(address_df$fullSearch)
+
+address_df <- merge(address_df, latLongs_address, by.x = "fullSearch", by.y = "query", all = TRUE)
+
+write.csv(address_df[is.na(address_df$lat),], "./data/addresses_to_manual_code.csv")
+
+manual_check <- read.csv("./data/addresses_to_manual_code.csv")
+manual_check <- manual_check[-1, c("fullSearch", "map_id", "Street", "City", "County", "State", "zip", "lat", "lon")]
+manual_check$lat <- c(38.774082, 38.709227, 38.568776, 38.597584, 38.559297, 38.549728,
+                      39.031224, 38.917010, 38.594167, 38.570983, 38.785832, 38.448900,
+                      38.426894, 38.797210, 38.555404, 38.670229, 38.735151,38.456225,
+                      38.798770, 38.832384, 38.244728, 39.043810, 26.547700, 38.788289,
+                      38.825421, 38.574970, 38.609405, 38.779019, 38.796322)
+manual_check$lon <- c(-90.275783, -89.934160, -90.490150, -90.529073, -90.513102, -90.527974,
+                      -91.161652, -104.828042, -90.471899, -90.646719, -90.723081, -90.537753,
+                      -91.163730, -90.286170, -91.354786, -90.233632, -90.628419, -90.459127,
+                      -90.253537, -90.302346, -90.080127, -90.850984, -80.155121, -90.653143,
+                      -90.307332, -90.510858, -90.496901, -90.584597, -90.717391)
+
+
+address_df <- rbind(address_df[!is.na(address_df$lat),names(manual_check)], manual_check)
+
+
+address_df <- address_df[!is.na(address_df$lat),] #df that has lat long boxes from open source maps
+
+write.csv(address_df, "./data/geocoded_addresses.csv", row.names = FALSE)
+
+
+#Now getting distance to nearest hwy
+for(i in 1:length(address_df$lat)){
+  print(i)
+  #constructs a small window around the address to grab all highways
+coords <- matrix(c((address_df$lon[i] - 0.05),(address_df$lon[i] + 0.05),
+                   (address_df$lat[i] - 0.05),(address_df$lat[i] + 0.05)), 
+                 byrow = TRUE, nrow = 2, ncol = 2, dimnames = list(c('x','y'),c('min','max'))) 
+location <- coords %>% opq()
+
+#extracts open street data. pulling motorways and motorway_links because - in the st louis area, at least -
+#that is interstates and interstate exits
+#details on osm features are here: https://wiki.openstreetmap.org/wiki/Map_features#Highway
+hwy <- location %>%
+  add_osm_feature(key = "highway", 
+                  value = c("motorway", "motorway_link")) %>%
+  osmdata_sf()
+
+primary_rd <- location %>%
+  add_osm_feature(key = "highway", 
+                  value = c("trunk", "trunk_link", "primary", "primary_link")) %>%
+  osmdata_sf()
+
+#Viz. dont want it in loop but helpful otherwise
+# ggplot() + geom_sf(data = primary_rd$osm_lines, fill = 'light blue') + theme_minimal() +
+#   geom_point(aes(x = address_df$lon[i],  y = address_df$lat[i], colour = "red"))
+# 
+#haversine is the as-the-crow-flies distance between2 points
+#calculate haversine distance for all roadway points and the address in question
+#then identify the minimum distance and save that as the "closest to the interstate" id
+#if no highways appear within the small window (it's about 8 km), just mark as NA
+#https://www.rdocumentation.org/packages/pracma/versions/1.9.9/topics/haversine
+roads_df <- as.data.frame(hwy$osm_points$geometry)
+primary_roads_df <- as.data.frame(primary_rd$osm_points$geometry)
+if(nrow(roads_df) > 0){
+roads_df <- st_coordinates(roads_df$geometry) #getting all the lat longs of all the roads
+roads_df <- data.frame(roads_df)
+  for(j in 1:length(roads_df$X)){
+             roads_df$distance_km[j] <- haversine(c(address_df$lat[i], address_df$lon[i]),
+            c(roads_df$Y[j], roads_df$X[j])) }#gives distance in k
+address_df$nearest_hwy_dist_km[i] <- min(roads_df$distance_km)}else{
+  address_df$nearest_hwy_dist_km[i] <- NA
+}
+
+if(nrow(primary_roads_df) > 0){
+  primary_roads_df <- st_coordinates(primary_roads_df$geometry)
+  primary_roads_df <- data.frame(primary_roads_df)
+  
+for(j in 1:length(primary_roads_df$X)){
+  primary_roads_df$distance_km[j] <- haversine(c(address_df$lat[i], address_df$lon[i]),
+                                       c(primary_roads_df$Y[j], primary_roads_df$X[j])) }#gives distance in k
+address_df$nearest_primary_dist_km[i] <- min(primary_roads_df$distance_km)}else{
+  address_df$nearest_primary_dist_km[i] <- NA
+}
+
+
+}
+
+address_df <- address_df[, c("map_id", "lat", "lon", "nearest_hwy_dist_km", "nearest_primary_dist_km")]
+address_df <- unique(address_df)
+write.csv(address_df, "./data/dist_to_hwy.csv", row.names = FALSE)

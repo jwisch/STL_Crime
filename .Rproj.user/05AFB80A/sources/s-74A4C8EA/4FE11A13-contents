@@ -1,0 +1,74 @@
+options(scipen = 999)
+library(data.table)
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(osmdata)
+library(data.table)
+library(tigris)
+library(acs)
+library(censusr)
+
+df <- read.csv("./Data/MAPS_with_ADI_and_location.csv")
+addresses <- read.csv("./Data/geocoded_addresses_with_census_block_and_ADI_plus_manual_updates.csv")
+
+df <- merge(df, addresses[, c("query", "lon", "lat")], by = c("lon", "lat"))
+df$query <- tolower(df$query)
+
+#drops to people with only stL addresses...this can still include some stL county folks though. Will require more cleaning
+tmp <- df[!(df$query %like% "lake st. louis, mo" | df$query %like% "lake st louis, mo" | df$query %like% "lake saint louis, mo") &
+            (df$query %like% "st. louis, mo" | df$query %like% "saint louis, mo" | df$query %like% "st louis, mo"),]
+
+
+brain_age <- read.csv("./Data/adrc_dbn.csv") #from pete
+
+brain_age <- brain_age[brain_age$TrueAge < 66,]
+
+df <- merge(tmp, brain_age, by.x = "id", by.y = "MAPID")
+df <- df[!duplicated(df[, c("id", "TrueAge")]),]
+
+
+#This site automatically matches addresses to geolocations: https://geocoding.geo.census.gov/geocoder/locations/addressbatch?form
+
+census_api_key("25f4f15b896d92ddbb4b02fdc8c281b9304e001b", overwrite = TRUE, install = TRUE)
+
+vars <- load_variables(year = 2017,
+                       dataset = "acs5",
+                       cache = TRUE)
+
+stl_value <- get_acs(geography = "tract"
+                     , state = c("MO")
+                     ,
+                     county = c( "St. Louis city")
+                     ,
+                     variables = "B19013_001"
+                     ,
+                     geometry = TRUE)
+
+
+census_block <- list()
+for(i in 1:length(df$lat)){
+  print(i)
+  census_block[[i]] <- tryCatch(
+    {tigris::call_geolocator_latlon(lat = df$lat[i],
+                                    lon = df$lon[i])
+    },
+    error = function(cond){
+      return(NA)
+    })
+}
+
+census_block <- as.data.frame(do.call(rbind, census_block))
+df$census_block <- census_block$V1
+df$GEOID <- substr(df$census_block, start = 1, stop = 11)
+
+plot_df <- merge(stl_value, df, 
+                 by = "GEOID", all.x = TRUE, all.y = FALSE)
+ggplot(plot_df) + geom_sf() + 
+  geom_point(aes(x = lon, y = lat), colour = "red", shape = 3, size = 0.6) + 
+  xlim(c(-90.32, -90.18)) + ylim(c(38.53, 38.76)) + theme_bw()
+
+#Contains 31 city dwellers from the ADRC
+
+ADRC_keepers <- plot_df[!is.na(plot_df$id),]
+write.csv(ADRC_keepers, "./Data/ADRC_participants_city_dwelling_with_matched_brain_age.csv", row.names = FALSE)
